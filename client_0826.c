@@ -1,28 +1,32 @@
 /*
- * NetMessenger - IE3010 Network Programming
- * Student: Pasindu Kalhara
- * Registration Number: IT23560826
+ * NetMessenger Client
+ * IE3010 Network Programming
  *
- * Personalisation:
- *   Server IP : 127.0.0.1
- *   Port      : 6826
- *   NID       : NID:5608
+ * Student       : Pasindu Kalhara
+ * Registration  : IT23560826
  *
- * Implemented client commands:
+ * Server IP     : 127.0.0.1
+ * Server Port   : 6826
+ * NID           : NID:5608
+ *
+ * Implemented client-side protocol:
  *   REGISTER
  *   LIST
  *   BCAST
+ *   PMSG
+ *   JOIN
+ *   LEAVE
+ *   ROOMS
+ *   RMSG
+ *   SENDFILE
  *   QUIT
  *
- * More protocol commands will be integrated in later
- * milestones without removing existing functionality.
+ * HELP is a local client command only.
  */
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,16 +39,25 @@
 #define BUFFER_SIZE 1024
 #define MAX_USERNAME 64
 
+
+/* =========================================================
+ * Global state
+ * ========================================================= */
+
 static int socket_fd = -1;
-static volatile sig_atomic_t connected = 1;
+
+static volatile int running = 1;
+
+static volatile int quit_requested = 0;
 
 
 /* =========================================================
  * Reliable send
  * ========================================================= */
-static ssize_t send_all(int fd,
-                        const void *data,
-                        size_t length)
+
+static ssize_t send_all(
+    const void *data,
+    size_t length)
 {
     const char *buffer =
         (const char *)data;
@@ -52,19 +65,21 @@ static ssize_t send_all(int fd,
     size_t total_sent = 0;
 
 
-    while (total_sent < length) {
-
-        ssize_t sent =
-            send(
-                fd,
-                buffer + total_sent,
-                length - total_sent,
-                MSG_NOSIGNAL
-            );
+    while (total_sent < length)
+    {
+        ssize_t sent;
 
 
-        if (sent > 0) {
+        sent = send(
+            socket_fd,
+            buffer + total_sent,
+            length - total_sent,
+            MSG_NOSIGNAL
+        );
 
+
+        if (sent > 0)
+        {
             total_sent +=
                 (size_t)sent;
 
@@ -73,8 +88,8 @@ static ssize_t send_all(int fd,
 
 
         if (sent == -1 &&
-            errno == EINTR) {
-
+            errno == EINTR)
+        {
             continue;
         }
 
@@ -88,14 +103,39 @@ static ssize_t send_all(int fd,
 
 
 /* =========================================================
- * Send line
+ * Send one protocol line
  * ========================================================= */
-static int send_line(const char *line)
+
+static int send_line(
+    const char *line)
 {
+    char buffer[BUFFER_SIZE];
+
+    int length;
+
+
+    length = snprintf(
+        buffer,
+        sizeof(buffer),
+        "%s\n",
+        line
+    );
+
+
+    if (length < 0 ||
+        (size_t)length >= sizeof(buffer))
+    {
+        printf(
+            "Message too long.\n"
+        );
+
+        return -1;
+    }
+
+
     return (int)send_all(
-        socket_fd,
-        line,
-        strlen(line)
+        buffer,
+        (size_t)length
     );
 }
 
@@ -103,35 +143,39 @@ static int send_line(const char *line)
 /* =========================================================
  * Receive one line
  * ========================================================= */
-static int recv_line(char *buffer,
-                     size_t buffer_size)
+
+static int recv_line(
+    char *buffer,
+    size_t buffer_size)
 {
     size_t position = 0;
 
 
-    if (buffer_size < 2) {
+    if (buffer_size < 2)
+    {
         return -1;
     }
 
 
-    while (1) {
-
+    while (1)
+    {
         char ch;
 
-
-        ssize_t received =
-            recv(
-                socket_fd,
-                &ch,
-                1,
-                0
-            );
+        ssize_t received;
 
 
-        if (received == 1) {
+        received = recv(
+            socket_fd,
+            &ch,
+            1,
+            0
+        );
 
-            if (ch == '\n') {
 
+        if (received == 1)
+        {
+            if (ch == '\n')
+            {
                 buffer[position] =
                     '\0';
 
@@ -140,12 +184,38 @@ static int recv_line(char *buffer,
 
 
             if (position + 1 <
-                buffer_size) {
-
+                buffer_size)
+            {
                 buffer[position++] =
                     ch;
+            }
+            else
+            {
+                /*
+                 * Drain oversized line.
+                 */
+                do
+                {
+                    received = recv(
+                        socket_fd,
+                        &ch,
+                        1,
+                        0
+                    );
 
-            } else {
+
+                    if (received <= 0)
+                    {
+                        break;
+                    }
+
+                } while (ch != '\n');
+
+
+                buffer[
+                    buffer_size - 1
+                ] = '\0';
+
 
                 return -2;
             }
@@ -155,14 +225,14 @@ static int recv_line(char *buffer,
         }
 
 
-        if (received == 0) {
-
+        if (received == 0)
+        {
             return 0;
         }
 
 
-        if (errno == EINTR) {
-
+        if (errno == EINTR)
+        {
             continue;
         }
 
@@ -173,39 +243,244 @@ static int recv_line(char *buffer,
 
 
 /* =========================================================
- * Background receiver
+ * Protocol help
  *
- * Receives:
- *   MSG JOIN ...
- *   MSG LEAVE ...
- *   MSG BCAST ...
- *
- * and also displays server responses.
+ * Local client display only.
+ * It does not add a new server protocol command.
  * ========================================================= */
-static void *receiver_thread(void *arg)
-{
-    char line[BUFFER_SIZE];
 
+static void print_protocol_help(void)
+{
+    printf(
+        "\n"
+        "============================================================\n"
+    );
+
+    printf(
+        "              NetMessenger Protocol Help\n"
+    );
+
+    printf(
+        "============================================================\n"
+    );
+
+    printf(
+        "REGISTER <username>\n"
+    );
+
+    printf(
+        "    Register a unique username.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "LIST\n"
+    );
+
+    printf(
+        "    List currently connected users.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "BCAST <message>\n"
+    );
+
+    printf(
+        "    Send a message to all other connected users.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "PMSG <username> <message>\n"
+    );
+
+    printf(
+        "    Send a private message to one user.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "JOIN <room>\n"
+    );
+
+    printf(
+        "    Create or join a chat room.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "LEAVE <room>\n"
+    );
+
+    printf(
+        "    Leave a chat room.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "ROOMS\n"
+    );
+
+    printf(
+        "    List currently available rooms.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "RMSG <room> <message>\n"
+    );
+
+    printf(
+        "    Send a message to members of a room.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "SENDFILE <target> <filename> <filesize>\n"
+    );
+
+    printf(
+        "    Send a file to a user or room.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "QUIT\n"
+    );
+
+    printf(
+        "    Disconnect cleanly from the server.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "HELP\n"
+    );
+
+    printf(
+        "    Display this help again.\n"
+    );
+
+    printf(
+        "------------------------------------------------------------\n"
+    );
+
+    printf(
+        "Server OK/ERR responses use: NID:5608\n"
+    );
+
+    printf(
+        "============================================================\n\n"
+    );
+}
+
+
+/* =========================================================
+ * Receiver thread
+ * ========================================================= */
+
+static void *receiver_thread(
+    void *arg)
+{
     (void)arg;
 
 
-    while (connected) {
+    while (running)
+    {
+        char line[BUFFER_SIZE];
 
-        int result =
-            recv_line(
-                line,
-                sizeof(line)
-            );
+        int result;
 
 
-        if (result == 1) {
+        result = recv_line(
+            line,
+            sizeof(line)
+        );
 
+
+        if (result == 1)
+        {
             printf(
-                "\nServer: %s\n",
+                "Server: %s\n",
                 line
             );
 
-            printf("> ");
+            fflush(stdout);
+
+
+            /*
+             * Server has confirmed clean
+             * disconnection.
+             */
+            if (strncmp(
+                    line,
+                    "OK BYE",
+                    6) == 0)
+            {
+                quit_requested = 1;
+
+                running = 0;
+
+                break;
+            }
+
+
+            continue;
+        }
+
+
+        if (result == 0)
+        {
+            if (running)
+            {
+                printf(
+                    "Server disconnected.\n"
+                );
+            }
+
+
+            running = 0;
+
+            break;
+        }
+
+
+        if (result == -2)
+        {
+            printf(
+                "Server sent an oversized line.\n"
+            );
 
             fflush(stdout);
 
@@ -213,7 +488,9 @@ static void *receiver_thread(void *arg)
         }
 
 
-        connected = 0;
+        perror("recv");
+
+        running = 0;
 
         break;
     }
@@ -224,28 +501,44 @@ static void *receiver_thread(void *arg)
 
 
 /* =========================================================
- * Connect to server
+ * Main
  * ========================================================= */
-static int connect_to_server(void)
+
+int main(void)
 {
     struct sockaddr_in server_address;
 
+    char username[MAX_USERNAME];
 
-    socket_fd =
-        socket(
-            AF_INET,
-            SOCK_STREAM,
-            0
-        );
+    char line[BUFFER_SIZE];
+
+    int registered = 0;
+
+    pthread_t receiver;
 
 
-    if (socket_fd == -1) {
+    /* =====================================================
+     * Create socket
+     * ===================================================== */
 
+    socket_fd = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0
+    );
+
+
+    if (socket_fd == -1)
+    {
         perror("socket");
 
-        return -1;
+        return EXIT_FAILURE;
     }
 
+
+    /* =====================================================
+     * Configure server address
+     * ===================================================== */
 
     memset(
         &server_address,
@@ -257,6 +550,7 @@ static int connect_to_server(void)
     server_address.sin_family =
         AF_INET;
 
+
     server_address.sin_port =
         htons(SERVER_PORT);
 
@@ -264,210 +558,48 @@ static int connect_to_server(void)
     if (inet_pton(
             AF_INET,
             SERVER_IP,
-            &server_address.sin_addr
-        ) != 1) {
-
+            &server_address.sin_addr) != 1)
+    {
         fprintf(
             stderr,
             "Invalid server address.\n"
         );
 
-        close(socket_fd);
-
-        socket_fd = -1;
-
-        return -1;
-    }
-
-
-    if (connect(
-            socket_fd,
-            (struct sockaddr *)&server_address,
-            sizeof(server_address)
-        ) == -1) {
-
-        perror("connect");
 
         close(socket_fd);
-
-        socket_fd = -1;
-
-        return -1;
-    }
-
-
-    return 0;
-}
-
-
-/* =========================================================
- * Register user
- *
- * The first protocol command on a new connection must
- * be REGISTER.
- * ========================================================= */
-static int register_user(void)
-{
-    char username[MAX_USERNAME];
-    char command[BUFFER_SIZE];
-    char response[BUFFER_SIZE];
-
-
-    while (connected) {
-
-        printf(
-            "Enter username: "
-        );
-
-        fflush(stdout);
-
-
-        if (fgets(
-                username,
-                sizeof(username),
-                stdin
-            ) == NULL) {
-
-            return -1;
-        }
-
-
-        username[
-            strcspn(
-                username,
-                "\r\n"
-            )
-        ] = '\0';
-
-
-        if (username[0] == '\0') {
-
-            printf(
-                "Username cannot be empty.\n"
-            );
-
-            continue;
-        }
-
-
-        if (snprintf(
-                command,
-                sizeof(command),
-                "REGISTER %s\n",
-                username
-            ) >= (int)sizeof(command)) {
-
-            printf(
-                "Username is too long.\n"
-            );
-
-            continue;
-        }
-
-
-        if (send_line(command) == -1) {
-
-            perror("send");
-
-            return -1;
-        }
-
-
-        int result =
-            recv_line(
-                response,
-                sizeof(response)
-            );
-
-
-        if (result == 0) {
-
-            printf(
-                "Server disconnected.\n"
-            );
-
-            return -1;
-        }
-
-
-        if (result == -1) {
-
-            perror("recv");
-
-            return -1;
-        }
-
-
-        if (result == -2) {
-
-            printf(
-                "Server response was too long.\n"
-            );
-
-            return -1;
-        }
-
-
-        printf(
-            "Server: %s\n",
-            response
-        );
-
-
-        if (strncmp(
-                response,
-                "OK REGISTERED ",
-                strlen("OK REGISTERED ")
-            ) == 0) {
-
-            return 0;
-        }
-
-
-        if (strncmp(
-                response,
-                "ERR ",
-                4
-            ) == 0) {
-
-            printf(
-                "Registration failed. "
-                "Please try another username.\n"
-            );
-
-            continue;
-        }
-
-
-        printf(
-            "Unexpected registration response.\n"
-        );
-    }
-
-
-    return -1;
-}
-
-
-/* =========================================================
- * Main client
- * ========================================================= */
-int main(void)
-{
-    pthread_t receiver;
-
-
-    signal(
-        SIGPIPE,
-        SIG_IGN
-    );
-
-
-    if (connect_to_server() == -1) {
 
         return EXIT_FAILURE;
     }
 
+
+    /* =====================================================
+     * Connect
+     * ===================================================== */
+
+    if (connect(
+            socket_fd,
+            (struct sockaddr *)&server_address,
+            sizeof(server_address)) == -1)
+    {
+        perror("connect");
+
+        close(socket_fd);
+
+        return EXIT_FAILURE;
+    }
+
+
+    printf(
+        "============================================================\n"
+    );
+
+    printf(
+        "              NetMessenger Client\n"
+    );
+
+    printf(
+        "============================================================\n"
+    );
 
     printf(
         "Connected to NetMessenger server.\n"
@@ -479,42 +611,154 @@ int main(void)
         SERVER_PORT
     );
 
+    printf(
+        "NID: NID:5608\n"
+    );
 
-    /* REGISTER must be the first command. */
-    if (register_user() == -1) {
+    printf(
+        "============================================================\n"
+    );
 
-        shutdown(
-            socket_fd,
-            SHUT_RDWR
+
+    /* =====================================================
+     * Registration
+     *
+     * IMPORTANT:
+     * "OK REGISTERED " is 14 characters.
+     * ===================================================== */
+
+    while (!registered)
+    {
+        int result;
+
+
+        printf(
+            "Server: WELCOME NetMessenger\n"
         );
 
-        close(socket_fd);
 
-        return EXIT_FAILURE;
+        printf(
+            "Enter username: "
+        );
+
+
+        fflush(stdout);
+
+
+        if (fgets(
+                username,
+                sizeof(username),
+                stdin) == NULL)
+        {
+            close(socket_fd);
+
+            return EXIT_FAILURE;
+        }
+
+
+        username[
+            strcspn(
+                username,
+                "\r\n"
+            )
+        ] = '\0';
+
+
+        if (username[0] == '\0')
+        {
+            printf(
+                "Username cannot be empty.\n"
+            );
+
+            continue;
+        }
+
+
+        snprintf(
+            line,
+            sizeof(line),
+            "REGISTER %s",
+            username
+        );
+
+
+        if (send_line(line) == -1)
+        {
+            perror("send");
+
+            close(socket_fd);
+
+            return EXIT_FAILURE;
+        }
+
+
+        result = recv_line(
+            line,
+            sizeof(line)
+        );
+
+
+        if (result != 1)
+        {
+            printf(
+                "Registration failed: "
+                "server disconnected.\n"
+            );
+
+
+            close(socket_fd);
+
+            return EXIT_FAILURE;
+        }
+
+
+        printf(
+            "Server: %s\n",
+            line
+        );
+
+
+        /*
+         * Correct protocol success check.
+         *
+         * "OK REGISTERED " = 14 characters.
+         *
+         * We also make sure that this is genuinely
+         * a registration success response.
+         */
+        if (strncmp(
+                line,
+                "OK REGISTERED ",
+                strlen("OK REGISTERED ")) == 0)
+        {
+            registered = 1;
+
+            break;
+        }
+
+
+        /*
+         * Duplicate username or another
+         * registration error.
+         */
+        printf(
+            "Registration was not accepted. "
+            "Try another username.\n"
+        );
     }
 
 
-    /*
-     * Start receiver thread only after successful
-     * registration. This prevents registration response
-     * and the initial prompt from racing.
-     */
+    /* =====================================================
+     * Start receiver thread
+     * ===================================================== */
+
     if (pthread_create(
             &receiver,
             NULL,
             receiver_thread,
-            NULL
-        ) != 0) {
-
-        fprintf(
-            stderr,
-            "Failed to create receiver thread.\n"
-        );
-
-        shutdown(
-            socket_fd,
-            SHUT_RDWR
-        );
+            NULL) != 0)
+    {
+        perror("pthread_create");
 
         close(socket_fd);
 
@@ -522,55 +766,104 @@ int main(void)
     }
 
 
-    /*
-     * Interactive protocol loop.
-     *
-     * Supported at this milestone:
-     *   LIST
-     *   BCAST <message>
-     *   QUIT
-     *
-     * Future commands will be added here while keeping
-     * the existing commands working.
-     */
-    while (connected) {
+    /* =====================================================
+     * Display protocol commands
+     * ===================================================== */
 
-        char command[BUFFER_SIZE];
+    print_protocol_help();
 
 
+    /* =====================================================
+     * Interactive command loop
+     * ===================================================== */
+
+    while (running)
+    {
         printf("> ");
 
         fflush(stdout);
 
 
         if (fgets(
-                command,
-                sizeof(command),
-                stdin
-            ) == NULL) {
+                line,
+                sizeof(line),
+                stdin) == NULL)
+        {
+            if (running)
+            {
+                (void)send_line(
+                    "QUIT"
+                );
+            }
 
             break;
         }
 
 
-        if (send_line(command) == -1) {
+        line[
+            strcspn(
+                line,
+                "\r\n"
+            )
+        ] = '\0';
+
+
+        if (line[0] == '\0')
+        {
+            continue;
+        }
+
+
+        /*
+         * HELP is local.
+         * It is NOT sent to server.
+         */
+        if (strcmp(
+                line,
+                "HELP") == 0)
+        {
+            print_protocol_help();
+
+            continue;
+        }
+
+
+        /*
+         * All official protocol commands
+         * are sent unchanged to server.
+         */
+        if (send_line(line) == -1)
+        {
+            perror("send");
+
+            running = 0;
 
             break;
         }
 
 
-        if (strncmp(
-                command,
-                "QUIT",
-                4
-            ) == 0) {
+        if (strcmp(
+                line,
+                "QUIT") == 0)
+        {
+            quit_requested = 1;
 
             break;
         }
     }
 
 
-    connected = 0;
+    /*
+     * Allow receiver thread to print
+     * OK BYE NID:5608.
+     */
+    if (quit_requested)
+    {
+        sleep(1);
+    }
+
+
+    running = 0;
 
 
     shutdown(
@@ -580,6 +873,9 @@ int main(void)
 
 
     close(socket_fd);
+
+
+    socket_fd = -1;
 
 
     pthread_join(
