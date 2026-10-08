@@ -1,0 +1,5 @@
+*.o
+server_0826
+client_0826
+core
+*.tmp
