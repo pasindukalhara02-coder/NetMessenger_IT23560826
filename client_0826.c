@@ -1,893 +1,897 @@
-/*
- * NetMessenger Client
- * IE3010 Network Programming
- *
- * Student       : Pasindu Kalhara
- * Registration  : IT23560826
- *
- * Server IP     : 127.0.0.1
- * Server Port   : 6826
- * NID           : NID:5608
- *
- * Implemented client-side protocol:
- *   REGISTER
- *   LIST
- *   BCAST
- *   PMSG
- *   JOIN
- *   LEAVE
- *   ROOMS
- *   RMSG
- *   SENDFILE
- *   QUIT
- *
- * HELP is a local client command only.
- */
+#define _GNU_SOURCE
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <unistd.h>
+#include <errno.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #define SERVER_IP "127.0.0.1"
-#define SERVER_PORT 6826
+#define PORT 6826
+#define NID 5608
 
-#define BUFFER_SIZE 1024
-#define MAX_USERNAME 64
+#define LINE_SIZE 2048
+#define IO_BUFFER_SIZE 8192
+#define MAX_FILE_SIZE (5ULL * 1024ULL * 1024ULL)
+#define USERNAME_LEN 50
+#define FILENAME_LEN 256
+#define TARGET_LEN 50
 
-
-/* =========================================================
- * Global state
- * ========================================================= */
-
-static int socket_fd = -1;
-
+static int sock_fd = -1;
 static volatile int running = 1;
+static pthread_t receiver_thread;
 
-static volatile int quit_requested = 0;
+/* ------------------------------------------------------------------
+   Buffered receiver.
 
-
-/* =========================================================
- * Reliable send
- * ========================================================= */
-
-static ssize_t send_all(
-    const void *data,
-    size_t length)
+   A single recv() may contain:
+   - a partial line,
+   - several lines, or
+   - a FILE header followed immediately by raw bytes.
+   The buffer keeps unread bytes so framing is preserved.
+   ------------------------------------------------------------------ */
+typedef struct
 {
-    const char *buffer =
-        (const char *)data;
+    int fd;
+    unsigned char buffer[IO_BUFFER_SIZE];
+    size_t start;
+    size_t end;
+} conn_reader_t;
 
-    size_t total_sent = 0;
+static int reader_refill(conn_reader_t *reader)
+{
+    if (reader->start < reader->end)
+        return 1;
 
+    reader->start = 0;
+    reader->end = 0;
 
-    while (total_sent < length)
+    for (;;)
     {
-        ssize_t sent;
+        ssize_t n = recv(reader->fd,
+                         reader->buffer,
+                         sizeof(reader->buffer),
+                         0);
 
-
-        sent = send(
-            socket_fd,
-            buffer + total_sent,
-            length - total_sent,
-            MSG_NOSIGNAL
-        );
-
-
-        if (sent > 0)
+        if (n < 0)
         {
-            total_sent +=
-                (size_t)sent;
-
-            continue;
+            if (errno == EINTR)
+                continue;
+            return -1;
         }
 
+        if (n == 0)
+            return 0;
 
-        if (sent == -1 &&
-            errno == EINTR)
-        {
-            continue;
-        }
-
-
-        return -1;
+        reader->end = (size_t)n;
+        return 1;
     }
-
-
-    return (ssize_t)total_sent;
 }
 
-
-/* =========================================================
- * Send one protocol line
- * ========================================================= */
-
-static int send_line(
-    const char *line)
+static ssize_t reader_line(conn_reader_t *reader,
+                           char *output,
+                           size_t output_size)
 {
-    char buffer[BUFFER_SIZE];
+    size_t used = 0;
 
-    int length;
-
-
-    length = snprintf(
-        buffer,
-        sizeof(buffer),
-        "%s\n",
-        line
-    );
-
-
-    if (length < 0 ||
-        (size_t)length >= sizeof(buffer))
-    {
-        printf(
-            "Message too long.\n"
-        );
-
-        return -1;
-    }
-
-
-    return (int)send_all(
-        buffer,
-        (size_t)length
-    );
-}
-
-
-/* =========================================================
- * Receive one line
- * ========================================================= */
-
-static int recv_line(
-    char *buffer,
-    size_t buffer_size)
-{
-    size_t position = 0;
-
-
-    if (buffer_size < 2)
-    {
-        return -1;
-    }
-
+    if (output == NULL || output_size == 0)
+        return -2;
 
     while (1)
     {
-        char ch;
+        size_t i;
 
-        ssize_t received;
-
-
-        received = recv(
-            socket_fd,
-            &ch,
-            1,
-            0
-        );
-
-
-        if (received == 1)
+        if (reader->start == reader->end)
         {
-            if (ch == '\n')
-            {
-                buffer[position] =
-                    '\0';
+            int rc = reader_refill(reader);
 
-                return 1;
+            if (rc == 0)
+            {
+                if (used == 0)
+                    return 0;
+
+                output[used] = '\0';
+                return (ssize_t)used;
             }
 
+            if (rc < 0)
+                return -1;
+        }
 
-            if (position + 1 <
-                buffer_size)
+        for (i = reader->start; i < reader->end; ++i)
+        {
+            if (reader->buffer[i] == '\n')
             {
-                buffer[position++] =
-                    ch;
-            }
-            else
-            {
-                /*
-                 * Drain oversized line.
-                 */
-                do
+                size_t count = i - reader->start;
+
+                if (used + count >= output_size)
                 {
-                    received = recv(
-                        socket_fd,
-                        &ch,
-                        1,
-                        0
-                    );
+                    reader->start = i + 1;
+                    return -2;
+                }
 
+                memcpy(output + used,
+                       reader->buffer + reader->start,
+                       count);
 
-                    if (received <= 0)
-                    {
-                        break;
-                    }
+                used += count;
+                reader->start = i + 1;
 
-                } while (ch != '\n');
+                while (used > 0 && output[used - 1] == '\r')
+                    --used;
 
-
-                buffer[
-                    buffer_size - 1
-                ] = '\0';
-
-
-                return -2;
+                output[used] = '\0';
+                return (ssize_t)used;
             }
-
-
-            continue;
         }
 
-
-        if (received == 0)
+        if (used + (reader->end - reader->start) >= output_size)
         {
-            return 0;
+            reader->start = reader->end;
+            return -2;
         }
 
+        memcpy(output + used,
+               reader->buffer + reader->start,
+               reader->end - reader->start);
 
-        if (errno == EINTR)
-        {
-            continue;
-        }
-
-
-        return -1;
+        used += reader->end - reader->start;
+        reader->start = reader->end;
     }
 }
 
-
-/* =========================================================
- * Protocol help
- *
- * Local client display only.
- * It does not add a new server protocol command.
- * ========================================================= */
-
-static void print_protocol_help(void)
+/* Read exactly length raw bytes from the same buffered TCP stream. */
+static int reader_exact(conn_reader_t *reader,
+                        void *data,
+                        uint64_t length)
 {
-    printf(
-        "\n"
-        "============================================================\n"
-    );
+    unsigned char *destination = (unsigned char *)data;
 
-    printf(
-        "              NetMessenger Protocol Help\n"
-    );
-
-    printf(
-        "============================================================\n"
-    );
-
-    printf(
-        "REGISTER <username>\n"
-    );
-
-    printf(
-        "    Register a unique username.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "LIST\n"
-    );
-
-    printf(
-        "    List currently connected users.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "BCAST <message>\n"
-    );
-
-    printf(
-        "    Send a message to all other connected users.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "PMSG <username> <message>\n"
-    );
-
-    printf(
-        "    Send a private message to one user.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "JOIN <room>\n"
-    );
-
-    printf(
-        "    Create or join a chat room.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "LEAVE <room>\n"
-    );
-
-    printf(
-        "    Leave a chat room.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "ROOMS\n"
-    );
-
-    printf(
-        "    List currently available rooms.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "RMSG <room> <message>\n"
-    );
-
-    printf(
-        "    Send a message to members of a room.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "SENDFILE <target> <filename> <filesize>\n"
-    );
-
-    printf(
-        "    Send a file to a user or room.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "QUIT\n"
-    );
-
-    printf(
-        "    Disconnect cleanly from the server.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "HELP\n"
-    );
-
-    printf(
-        "    Display this help again.\n"
-    );
-
-    printf(
-        "------------------------------------------------------------\n"
-    );
-
-    printf(
-        "Server OK/ERR responses use: NID:5608\n"
-    );
-
-    printf(
-        "============================================================\n\n"
-    );
-}
-
-
-/* =========================================================
- * Receiver thread
- * ========================================================= */
-
-static void *receiver_thread(
-    void *arg)
-{
-    (void)arg;
-
-
-    while (running)
+    while (length > 0)
     {
-        char line[BUFFER_SIZE];
-
-        int result;
-
-
-        result = recv_line(
-            line,
-            sizeof(line)
-        );
-
-
-        if (result == 1)
+        if (reader->start < reader->end)
         {
-            printf(
-                "Server: %s\n",
-                line
-            );
+            size_t available = reader->end - reader->start;
+            size_t take = available;
 
-            fflush(stdout);
+            if ((uint64_t)take > length)
+                take = (size_t)length;
 
+            memcpy(destination,
+                   reader->buffer + reader->start,
+                   take);
 
-            /*
-             * Server has confirmed clean
-             * disconnection.
-             */
-            if (strncmp(
-                    line,
-                    "OK BYE",
-                    6) == 0)
-            {
-                quit_requested = 1;
-
-                running = 0;
-
-                break;
-            }
-
-
+            reader->start += take;
+            destination += take;
+            length -= (uint64_t)take;
             continue;
         }
 
-
-        if (result == 0)
         {
-            if (running)
+            size_t want = (length > IO_BUFFER_SIZE)
+                        ? IO_BUFFER_SIZE
+                        : (size_t)length;
+
+            ssize_t n = recv(reader->fd,
+                             destination,
+                             want,
+                             0);
+
+            if (n < 0)
             {
-                printf(
-                    "Server disconnected.\n"
-                );
+                if (errno == EINTR)
+                    continue;
+                return -1;
             }
 
+            if (n == 0)
+                return -1;
 
-            running = 0;
+            destination += (size_t)n;
+            length -= (uint64_t)n;
+        }
+    }
 
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+static int send_all(int fd, const void *data, size_t length)
+{
+    const unsigned char *pointer = (const unsigned char *)data;
+
+    while (length > 0)
+    {
+        ssize_t sent = send(fd,
+                            pointer,
+                            length,
+                            MSG_NOSIGNAL);
+
+        if (sent < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        if (sent == 0)
+            return -1;
+
+        pointer += (size_t)sent;
+        length -= (size_t)sent;
+    }
+
+    return 0;
+}
+
+static int send_command(const char *command)
+{
+    char line[LINE_SIZE + 2];
+
+    if (command == NULL)
+        return -1;
+
+    if (snprintf(line, sizeof(line), "%s\n", command) >= (int)sizeof(line))
+    {
+        fprintf(stderr, "Command is too long.\n");
+        return -1;
+    }
+
+    return send_all(sock_fd, line, strlen(line));
+}
+
+/* ------------------------------------------------------------------ */
+static int mkdir_if_needed(const char *path)
+{
+    struct stat st;
+
+    if (mkdir(path, 0755) == 0)
+        return 0;
+
+    if (errno == EEXIST &&
+        stat(path, &st) == 0 &&
+        S_ISDIR(st.st_mode))
+        return 0;
+
+    return -1;
+}
+
+static int safe_basename(const char *input,
+                         char *output,
+                         size_t output_size)
+{
+    const char *base;
+    const char *slash;
+    const char *backslash;
+    size_t length;
+
+    if (input == NULL ||
+        output == NULL ||
+        output_size < 2 ||
+        input[0] == '\0')
+        return -1;
+
+    if (strcmp(input, ".") == 0 || strcmp(input, "..") == 0)
+        return -1;
+
+    if (strstr(input, "..") != NULL)
+        return -1;
+
+    slash = strrchr(input, '/');
+    backslash = strrchr(input, '\\');
+
+    base = input;
+
+    if (slash != NULL && slash + 1 > base)
+        base = slash + 1;
+
+    if (backslash != NULL && backslash + 1 > base)
+        base = backslash + 1;
+
+    if (*base == '\0')
+        return -1;
+
+    length = strlen(base);
+    if (length >= output_size)
+        return -1;
+
+    if (base[0] == '.')
+        return -1;
+
+    memcpy(output, base, length);
+    output[length] = '\0';
+    return 0;
+}
+
+/* ------------------------------------------------------------------
+   Receive a FILE header followed by exactly <filesize> raw bytes.
+   Files are stored locally under:
+       received_files/<sender>/<filename>
+   ------------------------------------------------------------------ */
+static int receive_file(conn_reader_t *reader,
+                        const char *sender,
+                        const char *filename,
+                        uint64_t file_size)
+{
+    char safe_sender[USERNAME_LEN];
+    char safe_filename[FILENAME_LEN];
+    char directory[512];
+    char path[1024];
+    FILE *file;
+    unsigned char buffer[IO_BUFFER_SIZE];
+    uint64_t remaining = file_size;
+
+    if (file_size > MAX_FILE_SIZE)
+        return -1;
+
+    if (safe_basename(sender,
+                      safe_sender,
+                      sizeof(safe_sender)) < 0)
+        return -1;
+
+    if (safe_basename(filename,
+                      safe_filename,
+                      sizeof(safe_filename)) < 0)
+        return -1;
+
+    if (mkdir_if_needed("received_files") < 0)
+        return -1;
+
+    snprintf(directory,
+             sizeof(directory),
+             "received_files/%s",
+             safe_sender);
+
+    if (mkdir_if_needed(directory) < 0)
+        return -1;
+
+    snprintf(path,
+             sizeof(path),
+             "%s/%s",
+             directory,
+             safe_filename);
+
+    file = fopen(path, "wb");
+    if (file == NULL)
+        return -1;
+
+    while (remaining > 0)
+    {
+        size_t chunk = remaining > sizeof(buffer)
+                     ? sizeof(buffer)
+                     : (size_t)remaining;
+
+        if (reader_exact(reader, buffer, (uint64_t)chunk) < 0)
+        {
+            fclose(file);
+            unlink(path);
+            return -1;
+        }
+
+        if (fwrite(buffer, 1, chunk, file) != chunk)
+        {
+            fclose(file);
+            unlink(path);
+            return -1;
+        }
+
+        remaining -= (uint64_t)chunk;
+    }
+
+    if (fclose(file) != 0)
+    {
+        unlink(path);
+        return -1;
+    }
+
+    printf("\nServer: FILE received from %s -> %s (%" PRIu64 " bytes)\n",
+           safe_sender,
+           path,
+           file_size);
+    printf("> ");
+    fflush(stdout);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+static int receive_server_line(int fd, char *line, size_t line_size)
+{
+    size_t used = 0;
+
+    while (used + 1 < line_size)
+    {
+        char ch;
+        ssize_t n = recv(fd, &ch, 1, 0);
+
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        if (n == 0)
+        {
+            if (used == 0)
+                return 0;
             break;
         }
 
+        if (ch == '\n')
+            break;
 
-        if (result == -2)
+        if (ch != '\r')
+            line[used++] = ch;
+    }
+
+    line[used] = '\0';
+    return (int)used;
+}
+
+/* ------------------------------------------------------------------ */
+static void print_help(void)
+{
+    printf("\n============================================================\n");
+    printf("NetMessenger Protocol Commands\n");
+    printf("============================================================\n");
+    printf("REGISTER <username>\n");
+    printf("LIST\n");
+    printf("BCAST <message>\n");
+    printf("PMSG <username> <message>\n");
+    printf("JOIN <room>\n");
+    printf("LEAVE <room>\n");
+    printf("ROOMS\n");
+    printf("RMSG <room> <message>\n");
+    printf("SENDFILE <target> <filename> <filesize>\n");
+    printf("QUIT\n");
+    printf("HELP (local command - not sent to server)\n");
+    printf("============================================================\n\n");
+}
+
+/* ------------------------------------------------------------------
+   Receiver thread starts only after registration succeeds.
+   ------------------------------------------------------------------ */
+static void *receive_messages(void *arg)
+{
+    int fd = *(int *)arg;
+    conn_reader_t reader;
+    char line[LINE_SIZE];
+
+    reader.fd = fd;
+    reader.start = 0;
+    reader.end = 0;
+
+    while (running)
+    {
+        ssize_t n = reader_line(&reader,
+                                line,
+                                sizeof(line));
+
+        if (n == 0)
         {
-            printf(
-                "Server sent an oversized line.\n"
-            );
+            if (running)
+                printf("\nServer disconnected.\n");
 
+            running = 0;
+            break;
+        }
+
+        if (n == -2)
+        {
+            printf("\nServer sent an overlong line.\n> ");
             fflush(stdout);
+            continue;
+        }
+
+        if (n < 0)
+        {
+            if (running && errno != ECONNRESET)
+                perror("recv");
+
+            running = 0;
+            break;
+        }
+
+        if (strncmp(line, "FILE ", 5) == 0)
+        {
+            char sender[USERNAME_LEN];
+            char filename[FILENAME_LEN];
+            unsigned long long parsed_size = 0;
+
+            if (sscanf(line,
+                       "FILE %49s %255s %llu",
+                       sender,
+                       filename,
+                       &parsed_size) != 3)
+            {
+                printf("\nServer: Invalid FILE header.\n> ");
+                fflush(stdout);
+                running = 0;
+                break;
+            }
+
+            if ((uint64_t)parsed_size > MAX_FILE_SIZE)
+            {
+                printf("\nServer: FILE is larger than the 5 MB receive limit.\n> ");
+                fflush(stdout);
+                running = 0;
+                break;
+            }
+
+            if (receive_file(&reader,
+                             sender,
+                             filename,
+                             (uint64_t)parsed_size) < 0)
+            {
+                printf("\nServer: FILE transfer failed.\n> ");
+                fflush(stdout);
+                running = 0;
+                break;
+            }
 
             continue;
         }
 
+        printf("\nServer: %s\n", line);
+        printf("> ");
+        fflush(stdout);
 
-        perror("recv");
-
-        running = 0;
-
-        break;
+        if (strcmp(line, "OK BYE NID:5608") == 0)
+        {
+            running = 0;
+            break;
+        }
     }
-
 
     return NULL;
 }
 
-
-/* =========================================================
- * Main
- * ========================================================= */
-
-int main(void)
+/* ------------------------------------------------------------------
+   Connect and perform the mandatory first REGISTER command.
+   Registration is synchronous so duplicate usernames can be retried
+   without starting the asynchronous receiver thread yet.
+   ------------------------------------------------------------------ */
+static int connect_and_register(void)
 {
     struct sockaddr_in server_address;
+    char welcome[LINE_SIZE];
+    char response[LINE_SIZE];
+    char username[USERNAME_LEN];
 
-    char username[MAX_USERNAME];
-
-    char line[BUFFER_SIZE];
-
-    int registered = 0;
-
-    pthread_t receiver;
-
-
-    /* =====================================================
-     * Create socket
-     * ===================================================== */
-
-    socket_fd = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
-
-
-    if (socket_fd == -1)
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_fd < 0)
     {
         perror("socket");
-
-        return EXIT_FAILURE;
+        return -1;
     }
 
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(PORT);
 
-    /* =====================================================
-     * Configure server address
-     * ===================================================== */
-
-    memset(
-        &server_address,
-        0,
-        sizeof(server_address)
-    );
-
-
-    server_address.sin_family =
-        AF_INET;
-
-
-    server_address.sin_port =
-        htons(SERVER_PORT);
-
-
-    if (inet_pton(
-            AF_INET,
-            SERVER_IP,
-            &server_address.sin_addr) != 1)
+    if (inet_pton(AF_INET,
+                  SERVER_IP,
+                  &server_address.sin_addr) <= 0)
     {
-        fprintf(
-            stderr,
-            "Invalid server address.\n"
-        );
-
-
-        close(socket_fd);
-
-        return EXIT_FAILURE;
+        perror("inet_pton");
+        close(sock_fd);
+        sock_fd = -1;
+        return -1;
     }
 
-
-    /* =====================================================
-     * Connect
-     * ===================================================== */
-
-    if (connect(
-            socket_fd,
-            (struct sockaddr *)&server_address,
-            sizeof(server_address)) == -1)
+    if (connect(sock_fd,
+                (struct sockaddr *)&server_address,
+                sizeof(server_address)) < 0)
     {
         perror("connect");
-
-        close(socket_fd);
-
-        return EXIT_FAILURE;
+        close(sock_fd);
+        sock_fd = -1;
+        return -1;
     }
 
+    printf("============================================================\n");
+    printf("              NetMessenger Client\n");
+    printf("============================================================\n");
+    printf("Connected to NetMessenger server.\n");
+    printf("Server: %s:%d\n", SERVER_IP, PORT);
+    printf("NID: NID:%d\n", NID);
+    printf("============================================================\n");
 
-    printf(
-        "============================================================\n"
-    );
-
-    printf(
-        "              NetMessenger Client\n"
-    );
-
-    printf(
-        "============================================================\n"
-    );
-
-    printf(
-        "Connected to NetMessenger server.\n"
-    );
-
-    printf(
-        "Server: %s:%d\n",
-        SERVER_IP,
-        SERVER_PORT
-    );
-
-    printf(
-        "NID: NID:5608\n"
-    );
-
-    printf(
-        "============================================================\n"
-    );
-
-
-    /* =====================================================
-     * Registration
-     *
-     * IMPORTANT:
-     * "OK REGISTERED " is 14 characters.
-     * ===================================================== */
-
-    while (!registered)
+    if (receive_server_line(sock_fd,
+                            welcome,
+                            sizeof(welcome)) <= 0)
     {
-        int result;
+        fprintf(stderr, "Failed to receive server welcome.\n");
+        close(sock_fd);
+        sock_fd = -1;
+        return -1;
+    }
 
+    printf("Server: %s\n", welcome);
 
-        printf(
-            "Server: WELCOME NetMessenger\n"
-        );
+    while (1)
+    {
+        char command[LINE_SIZE];
+        size_t length;
+        const char *prefix = "OK REGISTERED ";
 
-
-        printf(
-            "Enter username: "
-        );
-
-
+        printf("Enter username: ");
         fflush(stdout);
 
-
-        if (fgets(
-                username,
-                sizeof(username),
-                stdin) == NULL)
+        if (fgets(username, sizeof(username), stdin) == NULL)
         {
-            close(socket_fd);
-
-            return EXIT_FAILURE;
+            close(sock_fd);
+            sock_fd = -1;
+            return -1;
         }
 
-
-        username[
-            strcspn(
-                username,
-                "\r\n"
-            )
-        ] = '\0';
-
+        length = strcspn(username, "\r\n");
+        username[length] = '\0';
 
         if (username[0] == '\0')
         {
-            printf(
-                "Username cannot be empty.\n"
-            );
-
+            printf("Username cannot be empty.\n");
             continue;
         }
 
+        if (snprintf(command,
+                     sizeof(command),
+                     "REGISTER %s",
+                     username) >= (int)sizeof(command))
+        {
+            printf("Username is too long.\n");
+            continue;
+        }
 
-        snprintf(
-            line,
-            sizeof(line),
-            "REGISTER %s",
-            username
-        );
-
-
-        if (send_line(line) == -1)
+        if (send_command(command) < 0)
         {
             perror("send");
-
-            close(socket_fd);
-
-            return EXIT_FAILURE;
+            close(sock_fd);
+            sock_fd = -1;
+            return -1;
         }
 
-
-        result = recv_line(
-            line,
-            sizeof(line)
-        );
-
-
-        if (result != 1)
+        if (receive_server_line(sock_fd,
+                                response,
+                                sizeof(response)) <= 0)
         {
-            printf(
-                "Registration failed: "
-                "server disconnected.\n"
-            );
-
-
-            close(socket_fd);
-
-            return EXIT_FAILURE;
+            fprintf(stderr, "Server closed the connection during registration.\n");
+            close(sock_fd);
+            sock_fd = -1;
+            return -1;
         }
 
+        printf("Server: %s\n", response);
 
-        printf(
-            "Server: %s\n",
-            line
-        );
-
-
-        /*
-         * Correct protocol success check.
-         *
-         * "OK REGISTERED " = 14 characters.
-         *
-         * We also make sure that this is genuinely
-         * a registration success response.
-         */
-        if (strncmp(
-                line,
-                "OK REGISTERED ",
-                strlen("OK REGISTERED ")) == 0)
+        if (strncmp(response,
+                    prefix,
+                    strlen(prefix)) == 0)
         {
-            registered = 1;
-
-            break;
+            return 0;
         }
 
+        printf("Registration was not accepted. Try another username.\n");
+    }
+}
 
-        /*
-         * Duplicate username or another
-         * registration error.
-         */
-        printf(
-            "Registration was not accepted. "
-            "Try another username.\n"
-        );
+/* ------------------------------------------------------------------ */
+static int get_file_size(const char *filename, uint64_t *size_out)
+{
+    struct stat st;
+
+    if (stat(filename, &st) < 0)
+        return -1;
+
+    if (!S_ISREG(st.st_mode))
+    {
+        errno = EINVAL;
+        return -1;
     }
 
+    if (st.st_size < 0)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
 
-    /* =====================================================
-     * Start receiver thread
-     * ===================================================== */
+    *size_out = (uint64_t)st.st_size;
+    return 0;
+}
 
-    if (pthread_create(
-            &receiver,
-            NULL,
-            receiver_thread,
-            NULL) != 0)
+/* ------------------------------------------------------------------ */
+static int send_file_command(const char *input_command)
+{
+    char target[TARGET_LEN];
+    char filename[FILENAME_LEN];
+    unsigned long long user_size;
+    uint64_t actual_size;
+    FILE *file;
+    unsigned char buffer[IO_BUFFER_SIZE];
+    char header[LINE_SIZE];
+    uint64_t remaining;
+
+    if (sscanf(input_command,
+               "SENDFILE %49s %255s %llu",
+               target,
+               filename,
+               &user_size) != 3)
+    {
+        printf("Usage: SENDFILE <target> <filename> <filesize>\n");
+        return 0;
+    }
+
+    if (get_file_size(filename, &actual_size) < 0)
+    {
+        perror("stat");
+        return 0;
+    }
+
+    if (actual_size != (uint64_t)user_size)
+    {
+        printf("Specified filesize (%llu) does not match actual file size (%" PRIu64 ").\n",
+               user_size,
+               actual_size);
+        return 0;
+    }
+
+    if (actual_size > MAX_FILE_SIZE)
+    {
+        printf("File is larger than the 5 MB limit.\n");
+        return 0;
+    }
+
+    file = fopen(filename, "rb");
+    if (file == NULL)
+    {
+        perror("fopen");
+        return 0;
+    }
+
+    if (snprintf(header,
+                 sizeof(header),
+                 "SENDFILE %s %s %llu\n",
+                 target,
+                 filename,
+                 user_size) >= (int)sizeof(header))
+    {
+        printf("SENDFILE command is too long.\n");
+        fclose(file);
+        return 0;
+    }
+
+    /* Protocol: header newline, immediately followed by raw bytes. */
+    if (send_all(sock_fd, header, strlen(header)) < 0)
+    {
+        perror("send");
+        fclose(file);
+        running = 0;
+        return -1;
+    }
+
+    remaining = actual_size;
+
+    while (remaining > 0)
+    {
+        size_t chunk = remaining > sizeof(buffer)
+                     ? sizeof(buffer)
+                     : (size_t)remaining;
+
+        size_t got = fread(buffer, 1, chunk, file);
+
+        if (got != chunk)
+        {
+            fprintf(stderr, "File read failed.\n");
+            fclose(file);
+            running = 0;
+            return -1;
+        }
+
+        if (send_all(sock_fd, buffer, got) < 0)
+        {
+            perror("send");
+            fclose(file);
+            running = 0;
+            return -1;
+        }
+
+        remaining -= (uint64_t)got;
+    }
+
+    fclose(file);
+
+    printf("File data sent. Waiting for server response...\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+int main(void)
+{
+    char command[LINE_SIZE];
+
+    if (connect_and_register() < 0)
+        return EXIT_FAILURE;
+
+    running = 1;
+
+    printf("\nRegistration successful.\n");
+    print_help();
+
+    if (pthread_create(&receiver_thread,
+                       NULL,
+                       receive_messages,
+                       &sock_fd) != 0)
     {
         perror("pthread_create");
-
-        close(socket_fd);
-
+        close(sock_fd);
         return EXIT_FAILURE;
     }
 
-
-    /* =====================================================
-     * Display protocol commands
-     * ===================================================== */
-
-    print_protocol_help();
-
-
-    /* =====================================================
-     * Interactive command loop
-     * ===================================================== */
-
     while (running)
     {
-        printf("> ");
+        char *newline;
 
+        printf("> ");
         fflush(stdout);
 
-
-        if (fgets(
-                line,
-                sizeof(line),
-                stdin) == NULL)
+        if (fgets(command, sizeof(command), stdin) == NULL)
         {
             if (running)
             {
-                (void)send_line(
-                    "QUIT"
-                );
+                send_command("QUIT");
             }
-
             break;
         }
 
+        newline = strpbrk(command, "\r\n");
+        if (newline != NULL)
+            *newline = '\0';
 
-        line[
-            strcspn(
-                line,
-                "\r\n"
-            )
-        ] = '\0';
+        if (command[0] == '\0')
+            continue;
 
-
-        if (line[0] == '\0')
+        if (strcmp(command, "HELP") == 0)
         {
+            print_help();
             continue;
         }
 
-
-        /*
-         * HELP is local.
-         * It is NOT sent to server.
-         */
-        if (strcmp(
-                line,
-                "HELP") == 0)
+        if (strncmp(command, "SENDFILE ", 9) == 0)
         {
-            print_protocol_help();
+            int rc = send_file_command(command);
+
+            if (rc < 0)
+                break;
 
             continue;
         }
 
-
-        /*
-         * All official protocol commands
-         * are sent unchanged to server.
-         */
-        if (send_line(line) == -1)
+        if (send_command(command) < 0)
         {
             perror("send");
-
             running = 0;
-
             break;
         }
 
-
-        if (strcmp(
-                line,
-                "QUIT") == 0)
-        {
-            quit_requested = 1;
-
+        if (strcmp(command, "QUIT") == 0)
             break;
-        }
     }
-
-
-    /*
-     * Allow receiver thread to print
-     * OK BYE NID:5608.
-     */
-    if (quit_requested)
-    {
-        sleep(1);
-    }
-
 
     running = 0;
+    shutdown(sock_fd, SHUT_RDWR);
+    pthread_join(receiver_thread, NULL);
+    close(sock_fd);
+    sock_fd = -1;
 
-
-    shutdown(
-        socket_fd,
-        SHUT_RDWR
-    );
-
-
-    close(socket_fd);
-
-
-    socket_fd = -1;
-
-
-    pthread_join(
-        receiver,
-        NULL
-    );
-
-
-    printf(
-        "Client connection closed.\n"
-    );
-
-
+    printf("Client connection closed.\n");
     return EXIT_SUCCESS;
 }
