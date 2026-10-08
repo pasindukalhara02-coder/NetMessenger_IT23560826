@@ -393,10 +393,9 @@ static int receive_file(conn_reader_t *reader,
         return -1;
     }
 
-    printf("\nServer: FILE received from %s -> %s (%" PRIu64 " bytes)\n",
-           safe_sender,
-           path,
-           file_size);
+    printf("\n[FILE] Received from %s\n", safe_sender);
+    printf("       Saved to : %s\n", path);
+    printf("       File size: %" PRIu64 " bytes\n", file_size);
     printf("> ");
     fflush(stdout);
 
@@ -442,19 +441,30 @@ static int receive_server_line(int fd, char *line, size_t line_size)
 static void print_help(void)
 {
     printf("\n============================================================\n");
-    printf("NetMessenger Protocol Commands\n");
+    printf("                 NetMessenger Commands\n");
     printf("============================================================\n");
-    printf("REGISTER <username>\n");
-    printf("LIST\n");
-    printf("BCAST <message>\n");
-    printf("PMSG <username> <message>\n");
-    printf("JOIN <room>\n");
-    printf("LEAVE <room>\n");
-    printf("ROOMS\n");
-    printf("RMSG <room> <message>\n");
-    printf("SENDFILE <target> <filename> <filesize>\n");
-    printf("QUIT\n");
-    printf("HELP (local command - not sent to server)\n");
+    printf(" BASIC\n");
+    printf("   LIST                         Show online users\n");
+    printf("   BCAST <message>             Send to all other users\n");
+    printf("   PMSG <user> <message>       Send a private message\n");
+    printf("\n ROOMS\n");
+    printf("   JOIN <room>                 Join/create a room\n");
+    printf("   LEAVE <room>                Leave a room\n");
+    printf("   ROOMS                       Show available rooms\n");
+    printf("   RMSG <room> <message>       Send a room message\n");
+    printf("\n FILE SHARING\n");
+    printf("   SENDFILE <target> <file> <size>\n");
+    printf("                              Send a file to a user/room\n");
+    printf("   File limit: 5 MB\n");
+    printf("\n SESSION\n");
+    printf("   HELP                        Show this help\n");
+    printf("   QUIT                        Disconnect cleanly\n");
+    printf("\n EXAMPLE\n");
+    printf("   BCAST Hello everyone!\n");
+    printf("   PMSG kalhara2 Hello\n");
+    printf("   JOIN room1\n");
+    printf("   RMSG room1 Hello room!\n");
+    printf("   SENDFILE kalhara2 testfile.txt 44\n");
     printf("============================================================\n\n");
 }
 
@@ -480,7 +490,7 @@ static void *receive_messages(void *arg)
         if (n == 0)
         {
             if (running)
-                printf("\nServer disconnected.\n");
+                printf("\n[SERVER] Connection closed by server.\n");
 
             running = 0;
             break;
@@ -488,7 +498,7 @@ static void *receive_messages(void *arg)
 
         if (n == -2)
         {
-            printf("\nServer sent an overlong line.\n> ");
+            printf("\n[ERROR] Server sent an overlong response line.\n> ");
             fflush(stdout);
             continue;
         }
@@ -496,7 +506,7 @@ static void *receive_messages(void *arg)
         if (n < 0)
         {
             if (running && errno != ECONNRESET)
-                perror("recv");
+                fprintf(stderr, "[ERROR] Receive failed: %s\n", strerror(errno));
 
             running = 0;
             break;
@@ -514,7 +524,7 @@ static void *receive_messages(void *arg)
                        filename,
                        &parsed_size) != 3)
             {
-                printf("\nServer: Invalid FILE header.\n> ");
+                printf("\n[FILE] Invalid file header received from server.\n> ");
                 fflush(stdout);
                 running = 0;
                 break;
@@ -522,7 +532,7 @@ static void *receive_messages(void *arg)
 
             if ((uint64_t)parsed_size > MAX_FILE_SIZE)
             {
-                printf("\nServer: FILE is larger than the 5 MB receive limit.\n> ");
+                printf("\n[ERROR] Received file exceeds the 5 MB limit.\n> ");
                 fflush(stdout);
                 running = 0;
                 break;
@@ -533,7 +543,7 @@ static void *receive_messages(void *arg)
                              filename,
                              (uint64_t)parsed_size) < 0)
             {
-                printf("\nServer: FILE transfer failed.\n> ");
+                printf("\n[ERROR] File transfer failed.\n> ");
                 fflush(stdout);
                 running = 0;
                 break;
@@ -542,7 +552,12 @@ static void *receive_messages(void *arg)
             continue;
         }
 
-        printf("\nServer: %s\n", line);
+        if (strncmp(line, "ERR ", 4) == 0)
+            printf("\n[ERROR] Server: %s\n", line);
+        else if (strncmp(line, "OK ", 3) == 0)
+            printf("\n[SUCCESS] Server: %s\n", line);
+        else
+            printf("\n[INFO] Server: %s\n", line);
         printf("> ");
         fflush(stdout);
 
@@ -571,7 +586,7 @@ static int connect_and_register(void)
     sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0)
     {
-        perror("socket");
+        fprintf(stderr, "[ERROR] Could not create client socket: %s\n", strerror(errno));
         return -1;
     }
 
@@ -593,7 +608,8 @@ static int connect_and_register(void)
                 (struct sockaddr *)&server_address,
                 sizeof(server_address)) < 0)
     {
-        perror("connect");
+        fprintf(stderr, "[ERROR] Could not connect to %s:%d: %s\n",
+                SERVER_IP, PORT, strerror(errno));
         close(sock_fd);
         sock_fd = -1;
         return -1;
@@ -611,7 +627,7 @@ static int connect_and_register(void)
                             welcome,
                             sizeof(welcome)) <= 0)
     {
-        fprintf(stderr, "Failed to receive server welcome.\n");
+        fprintf(stderr, "[ERROR] Failed to receive the server welcome message.\n");
         close(sock_fd);
         sock_fd = -1;
         return -1;
@@ -640,7 +656,7 @@ static int connect_and_register(void)
 
         if (username[0] == '\0')
         {
-            printf("Username cannot be empty.\n");
+            printf("[ERROR] Username cannot be empty. Please try again.\n");
             continue;
         }
 
@@ -649,13 +665,13 @@ static int connect_and_register(void)
                      "REGISTER %s",
                      username) >= (int)sizeof(command))
         {
-            printf("Username is too long.\n");
+            printf("[ERROR] Username is too long. Please use a shorter name.\n");
             continue;
         }
 
         if (send_command(command) < 0)
         {
-            perror("send");
+            fprintf(stderr, "[ERROR] Send failed: %s\n", strerror(errno));
             close(sock_fd);
             sock_fd = -1;
             return -1;
@@ -671,7 +687,10 @@ static int connect_and_register(void)
             return -1;
         }
 
-        printf("Server: %s\n", response);
+        if (strncmp(response, "ERR ", 4) == 0)
+            printf("[ERROR] Server: %s\n", response);
+        else
+            printf("[SUCCESS] Server: %s\n", response);
 
         if (strncmp(response,
                     prefix,
@@ -680,7 +699,7 @@ static int connect_and_register(void)
             return 0;
         }
 
-        printf("Registration was not accepted. Try another username.\n");
+        printf("[INFO] Registration was not accepted. Please choose another username.\n");
     }
 }
 
@@ -713,32 +732,50 @@ static int send_file_command(const char *input_command)
 {
     char target[TARGET_LEN];
     char filename[FILENAME_LEN];
-    unsigned long long user_size;
+    unsigned long long user_size = 0;
     uint64_t actual_size;
     FILE *file;
     unsigned char buffer[IO_BUFFER_SIZE];
     char header[LINE_SIZE];
     uint64_t remaining;
+    char extra[2];
+    int fields;
 
-    if (sscanf(input_command,
-               "SENDFILE %49s %255s %llu",
-               target,
-               filename,
-               &user_size) != 3)
+    /*
+     * Keep malformed SENDFILE commands on the wire so the server can
+     * exercise and report the protocol-level error.
+     */
+    fields = sscanf(input_command,
+                    "SENDFILE %49s %255s %llu %1s",
+                    target,
+                    filename,
+                    &user_size,
+                    extra);
+
+    if (fields != 3)
     {
-        printf("Usage: SENDFILE <target> <filename> <filesize>\n");
+        if (send_command(input_command) < 0)
+        {
+            fprintf(stderr, "[ERROR] Could not send malformed SENDFILE command.\n");
+            running = 0;
+            return -1;
+        }
+
+        printf("[INFO] SENDFILE format sent to server for validation.\n");
         return 0;
     }
 
     if (get_file_size(filename, &actual_size) < 0)
     {
-        perror("stat");
+        printf("[ERROR] Cannot access local file '%s': %s\n",
+               filename,
+               strerror(errno));
         return 0;
     }
 
     if (actual_size != (uint64_t)user_size)
     {
-        printf("Specified filesize (%llu) does not match actual file size (%" PRIu64 ").\n",
+        printf("[ERROR] Specified filesize (%llu) does not match actual file size (%" PRIu64 ").\n",
                user_size,
                actual_size);
         return 0;
@@ -746,14 +783,14 @@ static int send_file_command(const char *input_command)
 
     if (actual_size > MAX_FILE_SIZE)
     {
-        printf("File is larger than the 5 MB limit.\n");
+        printf("[ERROR] File is larger than the 5 MB limit.\n");
         return 0;
     }
 
     file = fopen(filename, "rb");
     if (file == NULL)
     {
-        perror("fopen");
+        printf("[ERROR] Cannot open '%s': %s\n", filename, strerror(errno));
         return 0;
     }
 
@@ -764,15 +801,20 @@ static int send_file_command(const char *input_command)
                  filename,
                  user_size) >= (int)sizeof(header))
     {
-        printf("SENDFILE command is too long.\n");
+        printf("[ERROR] SENDFILE command is too long.\n");
         fclose(file);
         return 0;
     }
 
+    printf("[FILE] Sending '%s' (%" PRIu64 " bytes) -> %s\n",
+           filename,
+           actual_size,
+           target);
+
     /* Protocol: header newline, immediately followed by raw bytes. */
     if (send_all(sock_fd, header, strlen(header)) < 0)
     {
-        perror("send");
+        fprintf(stderr, "[ERROR] Failed to send SENDFILE header: %s\n", strerror(errno));
         fclose(file);
         running = 0;
         return -1;
@@ -790,7 +832,7 @@ static int send_file_command(const char *input_command)
 
         if (got != chunk)
         {
-            fprintf(stderr, "File read failed.\n");
+            fprintf(stderr, "[ERROR] Failed while reading '%s'.\n", filename);
             fclose(file);
             running = 0;
             return -1;
@@ -798,7 +840,7 @@ static int send_file_command(const char *input_command)
 
         if (send_all(sock_fd, buffer, got) < 0)
         {
-            perror("send");
+            fprintf(stderr, "[ERROR] Failed while sending file data: %s\n", strerror(errno));
             fclose(file);
             running = 0;
             return -1;
@@ -809,7 +851,7 @@ static int send_file_command(const char *input_command)
 
     fclose(file);
 
-    printf("File data sent. Waiting for server response...\n");
+    printf("[FILE] File data sent. Waiting for server response...\n");
     return 0;
 }
 
@@ -847,6 +889,7 @@ int main(void)
         {
             if (running)
             {
+                printf("\n[INFO] Input closed. Requesting clean disconnect...\n");
                 send_command("QUIT");
             }
             break;
@@ -865,7 +908,8 @@ int main(void)
             continue;
         }
 
-        if (strncmp(command, "SENDFILE ", 9) == 0)
+        if (strcmp(command, "SENDFILE") == 0 ||
+            strncmp(command, "SENDFILE ", 9) == 0)
         {
             int rc = send_file_command(command);
 

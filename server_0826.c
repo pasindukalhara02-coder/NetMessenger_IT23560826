@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 
 #define PORT 6826
 #define NID 5608
@@ -73,6 +74,8 @@ typedef struct
 static user_t users[MAX_USERS];
 static room_t rooms[MAX_ROOMS];
 static int user_count = 0;
+static volatile sig_atomic_t server_running = 1;
+static int server_fd_global = -1;
 
 static pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t rooms_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -80,6 +83,36 @@ static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
+static void server_shutdown_handler(int signal_number)
+{
+    (void)signal_number;
+    server_running = 0;
+
+    if (server_fd_global >= 0)
+    {
+        close(server_fd_global);
+        server_fd_global = -1;
+    }
+}
+
+static void print_server_banner(void)
+{
+    printf("\n============================================================\n");
+    printf("                 NetMessenger Server\n");
+    printf("============================================================\n");
+    printf(" Status : RUNNING\n");
+    printf(" Port   : %d\n", PORT);
+    printf(" NID    : %04d\n", NID);
+    printf(" Clients: up to %d\n", MAX_USERS);
+    printf(" Storage: %s/<sender>/\n", STORAGE_ROOT);
+    printf(" Log    : %s\n", LOG_FILE);
+    printf("------------------------------------------------------------\n");
+    printf(" Server console events: [START] [CONN] [REG] [CMD] [FILE]\n");
+    printf("                        [DISC] [WARN] [STOP]\n");
+    printf("============================================================\n\n");
+    fflush(stdout);
+}
+
 static void log_event(const char *message)
 {
     FILE *fp;
@@ -986,11 +1019,20 @@ static void handle_sendfile(int fd, const char *sender,
     char file_path[1024];
     int i;
 
-    if (sscanf(command, "SENDFILE %49s %255s %llu",
-               target, input_filename, &parsed_size) != 3)
     {
-        send_error(fd, "003", "INVALID_FILE_FORMAT");
-        return;
+        char extra[2];
+
+        if (sscanf(command,
+                   "SENDFILE %49s %255s %llu %1s",
+                   target,
+                   input_filename,
+                   &parsed_size,
+                   extra) != 3)
+        {
+            send_error(fd, "003", "INVALID_FILE_FORMAT");
+            log_event("Rejected malformed SENDFILE command");
+            return;
+        }
     }
 
     file_size = (uint64_t)parsed_size;
@@ -1000,6 +1042,7 @@ static void handle_sendfile(int fd, const char *sender,
         if (reader_discard(reader, file_size) < 0)
             return;
         send_error(fd, "004", "FILE_TOO_LARGE");
+        log_event("Rejected SENDFILE: file too large");
         return;
     }
 
@@ -1008,6 +1051,7 @@ static void handle_sendfile(int fd, const char *sender,
         if (reader_discard(reader, file_size) < 0)
             return;
         send_error(fd, "003", "INVALID_FILENAME");
+        log_event("Rejected SENDFILE: invalid filename");
         return;
     }
 
@@ -1085,6 +1129,11 @@ static void handle_sendfile(int fd, const char *sender,
                  "SENDFILE %s -> %s : %s (%" PRIu64 " bytes)",
                  sender, target, filename, file_size);
         log_event(log_message);
+        printf("[FILE] %s -> %s | %s | %" PRIu64 " bytes\n",
+               sender,
+               target,
+               filename,
+               file_size);
     }
 }
 
@@ -1109,7 +1158,8 @@ static void *client_thread(void *arg)
              ntohs(client->address.sin_port));
     log_event(log_message);
 
-    printf("Client connected: %s:%d\n", client_ip,
+    printf("[CONN] Client connected from %s:%d\n",
+           client_ip,
            ntohs(client->address.sin_port));
 
     free(client);
@@ -1143,7 +1193,10 @@ static void *client_thread(void *arg)
         if (line[0] == '\0')
             continue;
 
-        printf("Received from client: %s\n", line);
+        if (registered)
+            printf("[CMD ] %-16s %s\n", username, line);
+        else
+            printf("[CMD ] <unregistered>  %s\n", line);
 
         /* REGISTER must be the first command. */
         if (strncmp(line, "REGISTER ", 9) == 0)
@@ -1178,6 +1231,7 @@ static void *client_thread(void *arg)
 
                 snprintf(log_message, sizeof(log_message),
                          "User registered: %s", username);
+                printf("[REG ] %-16s registered successfully\n", username);
                 log_event(log_message);
 
                 {
@@ -1321,6 +1375,8 @@ int main(void)
     struct sockaddr_in server_address;
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, server_shutdown_handler);
+    signal(SIGTERM, server_shutdown_handler);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
@@ -1329,11 +1385,14 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+    server_fd_global = server_fd;
+
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
                    &opt, sizeof(opt)) < 0)
     {
         perror("setsockopt SO_REUSEADDR");
         close(server_fd);
+        server_fd_global = -1;
         return EXIT_FAILURE;
     }
 
@@ -1347,6 +1406,7 @@ int main(void)
     {
         perror("bind");
         close(server_fd);
+        server_fd_global = -1;
         return EXIT_FAILURE;
     }
 
@@ -1354,43 +1414,56 @@ int main(void)
     {
         perror("listen");
         close(server_fd);
+        server_fd_global = -1;
         return EXIT_FAILURE;
     }
 
-    printf("==============================================\n");
-    printf(" NetMessenger Server\n");
-    printf(" Port : %d\n", PORT);
-    printf(" NID  : %04d\n", NID);
-    printf("==============================================\n");
-
+    print_server_banner();
+    printf("[START] Listening for TCP clients on port %d...\n", PORT);
     log_event("Server started on port 6826");
 
-    while (1)
+    while (server_running)
     {
         client_info_t *client;
-        socklen_t address_length = sizeof(client->address);
+        socklen_t address_length;
         pthread_t thread;
 
         client = malloc(sizeof(*client));
         if (client == NULL)
         {
-            fprintf(stderr, "malloc failed\n");
+            fprintf(stderr, "[WARN] malloc failed; waiting for next client.\n");
             continue;
         }
+
+        memset(client, 0, sizeof(*client));
+        address_length = sizeof(client->address);
 
         client->socket_fd = accept(server_fd,
                                     (struct sockaddr *)&client->address,
                                     &address_length);
+
         if (client->socket_fd < 0)
         {
-            perror("accept");
+            if (!server_running)
+            {
+                free(client);
+                break;
+            }
+
+            if (errno == EINTR)
+            {
+                free(client);
+                continue;
+            }
+
+            perror("[WARN] accept");
             free(client);
             continue;
         }
 
         if (pthread_create(&thread, NULL, client_thread, client) != 0)
         {
-            perror("pthread_create");
+            perror("[WARN] pthread_create");
             close(client->socket_fd);
             free(client);
             continue;
@@ -1399,6 +1472,16 @@ int main(void)
         pthread_detach(thread);
     }
 
-    close(server_fd);
+    if (server_fd_global >= 0)
+    {
+        close(server_fd_global);
+        server_fd_global = -1;
+    }
+
+    log_event("Server stopped");
+    printf("\n============================================================\n");
+    printf("[STOP ] NetMessenger server stopped cleanly.\n");
+    printf("============================================================\n");
+
     return EXIT_SUCCESS;
 }
