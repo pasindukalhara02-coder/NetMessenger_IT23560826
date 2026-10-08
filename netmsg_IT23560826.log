@@ -119,3 +119,43 @@
 [2026-10-08 18:28:07] ERR 007 INVALID_COMMAND
 [2026-10-08 18:28:33] ERR 007 INVALID_COMMAND
 [2026-10-08 18:43:28] SERVER_STOPPED
+[2026-10-08 20:56:34] Server started on port 6826
+[2026-10-08 20:56:49] Connection from 127.0.0.1:43908
+[2026-10-08 20:56:58] User registered: kalhara1
+[2026-10-08 20:57:34] Connection from 127.0.0.1:49348
+[2026-10-08 20:57:45] User registered: kalhara2
+[2026-10-08 21:00:33] SENDFILE kalhara1 -> kalhara2 : testfile.txt (44 bytes)
+[2026-10-08 21:13:35] User kalhara1 joined room room1 (created)
+[2026-10-08 21:13:52] User kalhara2 joined room room1
+[2026-10-08 21:14:28] SENDFILE kalhara1 -> room1 : testfile.txt (44 bytes)
+[2026-10-08 21:47:59] Server started on port 6826
+[2026-10-08 21:48:09] Connection from 127.0.0.1:51604
+[2026-10-08 21:48:15] User registered: kalhara1
+[2026-10-08 21:48:23] Connection from 127.0.0.1:50234
+[2026-10-08 21:48:28] User registered: kalhara2
+[2026-10-08 21:48:48] Connection from 127.0.0.1:43246
+[2026-10-08 21:48:48] User registered: filetester
+[2026-10-08 21:48:50] User disconnected: filetester
+[2026-10-08 21:58:48] User disconnected: kalhara1
+[2026-10-08 22:05:27] Server started on port 6826
+[2026-10-08 22:05:50] Connection from 127.0.0.1:43770
+[2026-10-08 22:06:12] User registered: kalhara1
+[2026-10-08 22:08:18] Connection from 127.0.0.1:50508
+[2026-10-08 22:08:24] User registered: kalhara2
+[2026-10-08 22:08:51] Rejected malformed SENDFILE command
+[2026-10-08 22:10:24] Rejected SENDFILE: invalid filename
+[2026-10-08 22:13:36] Server stopped
+[2026-10-08 22:17:59] Server started on port 6826
+[2026-10-08 22:18:04] Connection from 127.0.0.1:34232
+[2026-10-08 22:18:09] User registered: kalhara1
+[2026-10-08 22:18:16] Connection from 127.0.0.1:46726
+[2026-10-08 22:18:21] User registered: kalhara2
+[2026-10-08 22:18:39] User disconnected: kalhara1
+[2026-10-08 22:30:26] User disconnected: kalhara2
+[2026-10-08 22:33:45] Connection from 127.0.0.1:37836
+[2026-10-08 22:33:52] User registered: kalhara1
+[2026-10-08 22:34:35] Connection from 127.0.0.1:43544
+[2026-10-08 22:34:40] User registered: kalhara2
+[2026-10-08 22:36:07] User disconnected: kalhara1
+[2026-10-08 22:38:34] Connection from 127.0.0.1:59118
+[2026-10-08 22:38:41] User registered: kalhara1
