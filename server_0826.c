@@ -34,6 +34,10 @@
 #define MAX_TARGET_LEN 50
 #define MAX_FILE_SIZE (5ULL * 1024ULL * 1024ULL)
 
+/* Optional extension: basic flood protection. */
+#define RATE_LIMIT_MAX_MESSAGES 10
+#define RATE_LIMIT_WINDOW_SECONDS 5
+
 #define LOG_FILE "netmsg_IT23560826.log"
 #define STORAGE_ROOT "storage/IT23560826"
 
@@ -106,9 +110,11 @@ static void print_server_banner(void)
     printf(" Clients: up to %d\n", MAX_USERS);
     printf(" Storage: %s/<sender>/\n", STORAGE_ROOT);
     printf(" Log    : %s\n", LOG_FILE);
+    printf(" Rate   : %d BCAST/PMSG/RMSG commands per %d seconds\n",
+           RATE_LIMIT_MAX_MESSAGES, RATE_LIMIT_WINDOW_SECONDS);
     printf("------------------------------------------------------------\n");
     printf(" Server console events: [START] [CONN] [REG] [CMD] [FILE]\n");
-    printf("                        [DISC] [WARN] [STOP]\n");
+    printf("                        [DISC] [RATE] [WARN] [STOP]\n");
     printf("============================================================\n\n");
     fflush(stdout);
 }
@@ -189,6 +195,24 @@ static void send_error(int fd, const char *code, const char *reason)
     snprintf(response, sizeof(response), "ERR %s %s NID:%d\n",
              code, reason, NID);
     send_text(fd, response);
+}
+
+static int allow_message_command(int *message_count, time_t *window_start)
+{
+    time_t now = time(NULL);
+
+    if (*window_start == 0 ||
+        now - *window_start >= RATE_LIMIT_WINDOW_SECONDS)
+    {
+        *window_start = now;
+        *message_count = 0;
+    }
+
+    if (*message_count >= RATE_LIMIT_MAX_MESSAGES)
+        return 0;
+
+    ++(*message_count);
+    return 1;
 }
 
 /* ------------------------------------------------------------------
@@ -1148,6 +1172,8 @@ static void *client_thread(void *arg)
     int registered = 0;
     conn_reader_t reader;
     char log_message[LINE_SIZE];
+    int message_count = 0;
+    time_t message_window_start = 0;
 
     if (inet_ntop(AF_INET, &client->address.sin_addr,
                   client_ip, sizeof(client_ip)) == NULL)
@@ -1279,18 +1305,42 @@ static void *client_thread(void *arg)
         if (strcmp(line, "BCAST") == 0 || strncmp(line, "BCAST ", 6) == 0)
         {
             if (strcmp(line, "BCAST") == 0)
+            {
                 send_error(fd, "002", "INVALID_MESSAGE_FORMAT");
+            }
+            else if (!allow_message_command(&message_count, &message_window_start))
+            {
+                send_error(fd, "006", "RATE_LIMITED");
+                printf("[RATE] %-16s message limit reached\n", username);
+                snprintf(log_message, sizeof(log_message),
+                         "Rate limited BCAST from %s", username);
+                log_event(log_message);
+            }
             else
+            {
                 handle_bcast(fd, username, line);
+            }
             continue;
         }
 
         if (strcmp(line, "PMSG") == 0 || strncmp(line, "PMSG ", 5) == 0)
         {
             if (strcmp(line, "PMSG") == 0)
+            {
                 send_error(fd, "002", "INVALID_MESSAGE_FORMAT");
+            }
+            else if (!allow_message_command(&message_count, &message_window_start))
+            {
+                send_error(fd, "006", "RATE_LIMITED");
+                printf("[RATE] %-16s message limit reached\n", username);
+                snprintf(log_message, sizeof(log_message),
+                         "Rate limited PMSG from %s", username);
+                log_event(log_message);
+            }
             else
+            {
                 handle_pmsg(fd, username, line);
+            }
             continue;
         }
 
@@ -1321,9 +1371,21 @@ static void *client_thread(void *arg)
         if (strcmp(line, "RMSG") == 0 || strncmp(line, "RMSG ", 5) == 0)
         {
             if (strcmp(line, "RMSG") == 0)
+            {
                 send_error(fd, "003", "INVALID_MESSAGE_FORMAT");
+            }
+            else if (!allow_message_command(&message_count, &message_window_start))
+            {
+                send_error(fd, "006", "RATE_LIMITED");
+                printf("[RATE] %-16s message limit reached\n", username);
+                snprintf(log_message, sizeof(log_message),
+                         "Rate limited RMSG from %s", username);
+                log_event(log_message);
+            }
             else
+            {
                 handle_room_message(fd, username, line);
+            }
             continue;
         }
 
